@@ -3,76 +3,40 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'dart:io';
-import 'dart:async'; // Ajouté pour le Timer
 import 'package:i_presence/utils/constante.dart';
-import 'package:jwt_decoder/jwt_decoder.dart' as jwt;
+import 'package:shared_preferences/shared_preferences.dart';
 
 class AuthModel extends ChangeNotifier {
   String? _token;
   String? _role;
   int? _userId;
-  final storage = const FlutterSecureStorage();
-  Timer? _tokenExpiryTimer;
+  DateTime? _tokenExpiry;
+  final _storage = const FlutterSecureStorage();
+  final _prefs = SharedPreferences.getInstance();
 
   bool get isAuthenticated => _token != null;
   String? get token => _token;
   String? get role => _role;
   int? get userId => _userId;
+  DateTime? get tokenExpiry => _tokenExpiry;
 
   Future<void> loadStoredAuth() async {
-    _token = await storage.read(key: 'token');
-    
-    // Vérifier si le token existe et s'il est expiré
-    if (_token != null) {
-      if (isTokenExpired(_token!)) {
-        // Si le token est expiré, effacer les informations d'authentification
-        print('Token expiré, déconnexion automatique');
-        await logout();
+    _token = await _storage.read(key: 'token');
+    _role = await _storage.read(key: 'role');
+    final userId = await _storage.read(key: 'userId');
+
+    final expiryStr = await _storage.read(key: 'tokenExpiry');
+
+    if (_token != null && expiryStr != null) {
+      _tokenExpiry = DateTime.parse(expiryStr);
+      if (_tokenExpiry!.isBefore(DateTime.now())) {
+        await logout(); // Token expiré → déconnexion
         return;
-      } else {
-        // Si le token est valide, charger les autres informations
-        _role = await storage.read(key: 'role');
-        final userId = await storage.read(key: 'userId');
-        _userId = userId != null ? int.parse(userId) : null;
-        
-        // Configurer le timer pour la déconnexion automatique
-        _setAutoLogoutTimer(_token!);
-        
-        notifyListeners();
       }
     }
-  }
-  
-  // Méthode pour vérifier si un token est expiré
-  bool isTokenExpired(String token) {
-    try {
-      return jwt.JwtDecoder.isExpired(token);
-    } catch (e) {
-      print('Erreur lors de la vérification du token: $e');
-      return true;
-    }
-  }
 
-  // Méthode pour configurer le timer de déconnexion automatique
-  void _setAutoLogoutTimer(String token) {
-    // Annuler le timer existant si présent
-    _tokenExpiryTimer?.cancel();
-    
-    try {
-      // Obtenir la date d'expiration du token
-      final expiryDate = jwt.JwtDecoder.getExpirationDate(token);
-      final timeToExpiry = expiryDate.difference(DateTime.now());
-      
-      print('Token expire dans: ${timeToExpiry.inMinutes} minutes');
-      
-      // Configurer le timer pour se déconnecter automatiquement à l'expiration
-      _tokenExpiryTimer = Timer(timeToExpiry, () async {
-        print('Timer expiré, déconnexion automatique');
-        await logout();
-      });
-    } catch (e) {
-      print('Erreur lors de la configuration du timer d\'expiration: $e');
-    }
+    _userId = userId != null ? int.parse(userId) : null;
+    notifyListeners();
   }
   
   Future<bool> login(String email, String password) async {
@@ -139,15 +103,17 @@ class AuthModel extends ChangeNotifier {
             print('User object was null in response');
           }
           
+          // Lecture de expires_in depuis l'API
+          int expiresIn = data['expires_in'] ?? 3600; // fallback 1h
+          _tokenExpiry = DateTime.now().add(Duration(seconds: expiresIn));
+
           // Store values in secure storage
-          await storage.write(key: 'token', value: _token);
-          await storage.write(key: 'role', value: _role);
-          await storage.write(key: 'userId', value: _userId?.toString());
+          await _storage.write(key: 'token', value: _token);
+          await _storage.write(key: 'role', value: _role);
+          await _storage.write(key: 'userId', value: _userId?.toString());
           print('Credentials saved to secure storage');
-          
-          // Configurer le timer pour la déconnexion automatique
-          _setAutoLogoutTimer(_token!);
-          
+          await _storage.write(key: 'tokenExpiry', value: _tokenExpiry!.toIso8601String());
+
           notifyListeners();
           return true;
         } catch (e) {
@@ -166,35 +132,36 @@ class AuthModel extends ChangeNotifier {
   }
 
   Future<void> logout() async {
+    _token = null;
+    _role = null;
+    _userId = null;
+    _tokenExpiry = null;
+    await _storage.deleteAll();
+    notifyListeners();
+  }
+
+  Future<bool> validateToken() async {
+    if (_token == null) return false;
+
     try {
-      if (_token != null) {
-        final response = await http.post(
-          Uri.parse('$KbaseUrl/api/logout'),  // Make sure to include /api/ if needed
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer $_token',
-          },
-        );
-        
-        print('Logout response: ${response.statusCode}');
+      final response = await http.get(
+        Uri.parse('$KbaseUrl/api/user'), // ou une route protégée
+        headers: {
+          'Authorization': 'Bearer $_token',
+          'Accept': 'application/json',
+        },
+      );
+
+      if (response.statusCode == 200) {
+        return true;
+      } else {
+        print('Token invalide ou expiré');
+        await logout(); // on efface le token si invalide
+        return false;
       }
     } catch (e) {
-      print('Logout error: $e');
-    } finally {
-      // Annuler le timer de déconnexion automatique
-      _tokenExpiryTimer?.cancel();
-      _tokenExpiryTimer = null;
-      
-      // Always clear local data regardless of server response
-      _token = null;
-      _role = null;
-      _userId = null;
-      
-      await storage.delete(key: 'token');
-      await storage.delete(key: 'role');
-      await storage.delete(key: 'userId');
-      
-      notifyListeners();
+      print('Erreur de validation du token: $e');
+      return false;
     }
   }
 }

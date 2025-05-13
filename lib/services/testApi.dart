@@ -30,7 +30,7 @@ class APIService {
     }
   }
   
-  Future<List<Course>> fetchTeacherCourses() async {
+  Future<List<Cours>> fetchTeacherCourses() async {
     final response = await http.get(
       Uri.parse('$baseUrl/teacher/courses'),
       headers: {
